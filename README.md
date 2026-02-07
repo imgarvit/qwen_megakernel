@@ -6,7 +6,7 @@ This megakernel is aggressively optimized for Qwen3-0.6B (bf16) shapes to be run
 | Backend      | tok/s | ms/tok | Speedup |
 |--------------|-------|--------|---------|
 | PyTorch (HF) | 86.1  | 11.62  | 1.00x   |
-| Megakernel   | 771.7 | 1.30   | 8.97x   |
+| Megakernel   | 793.1 | 1.26   | 9.31x   |
 
 
 To use this:

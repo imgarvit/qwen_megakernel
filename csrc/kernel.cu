@@ -589,13 +589,21 @@ __device__ void ldg_prefetch_weights_l2(
 
 __device__ void ldg_attention(
     cg::grid_group& grid,
-    const float* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k_cache,
-    const __nv_bfloat16* __restrict__ v_cache,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
     float* __restrict__ attn_out,
     int cache_len,
     int max_seq_len,
     float attn_scale,
+    // QK norm parameters (fused to eliminate a grid.sync)
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_table,
+    const __nv_bfloat16* __restrict__ sin_table,
+    int position,
     // Weights to prefetch during attention (for blocks not doing attention)
     const __nv_bfloat16* __restrict__ o_weight,
     const __nv_bfloat16* __restrict__ gate_weight,
@@ -607,64 +615,107 @@ __device__ void ldg_attention(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    // Only first NUM_Q_HEADS blocks do attention work
-    // Remaining blocks prefetch post-attention weights to warm L2 cache
     const int ATTN_BLOCKS = NUM_Q_HEADS;  // 16 blocks for 16 Q heads
+    const __nv_bfloat16* cos_pos = cos_table + position * HEAD_DIM;
+    const __nv_bfloat16* sin_pos = sin_table + position * HEAD_DIM;
 
+    // -- Fused QK norm: block 0 handles all K heads, attention blocks handle Q --
+    // Block 0: K norm + RoPE + KV cache write (8 heads × 128 dim — trivial)
+    if (block_id == 0) {
+        for (int h = warp_id; h < NUM_KV_HEADS; h += LDG_NUM_WARPS) {
+            float* k_head = k + h * HEAD_DIM;
+            const float* v_head = v + h * HEAD_DIM;
+            __nv_bfloat16* kc = k_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+            __nv_bfloat16* vc = v_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+
+            float ss = 0.0f;
+            for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE) ss += k_head[i] * k_head[i];
+            ss = ldg_warp_reduce_sum(ss);
+            float sc = rsqrtf(ss / float(HEAD_DIM) + LDG_RMS_EPS);
+            sc = __shfl_sync(0xffffffff, sc, 0);
+
+            float kl[HEAD_DIM / WARP_SIZE];
+            #pragma unroll
+            for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
+                kl[j] = k_head[i] * sc * __bfloat162float(__ldg(k_norm_weight + i));
+            #pragma unroll
+            for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
+                float cv = __bfloat162float(__ldg(cos_pos + i));
+                float sv = __bfloat162float(__ldg(sin_pos + i));
+                int po = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
+                int pi = i + po, pj = pi / WARP_SIZE;
+                float pv = __shfl_sync(0xffffffff, kl[pj], pi % WARP_SIZE);
+                float kf = (i < HEAD_DIM/2) ? kl[j]*cv - pv*sv : pv*sv + kl[j]*cv;
+                kc[i] = __float2bfloat16(kf);
+                vc[i] = __float2bfloat16(v_head[i]);
+            }
+        }
+    }
+    // Attention blocks: Q norm + RoPE for own head (warp 0 only — 128 elements)
+    if (block_id < ATTN_BLOCKS && block_id < NUM_Q_HEADS && warp_id == 0) {
+        float* qh = q + block_id * HEAD_DIM;
+        float ss = 0.0f;
+        for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE) ss += qh[i] * qh[i];
+        ss = ldg_warp_reduce_sum(ss);
+        float sc = rsqrtf(ss / float(HEAD_DIM) + LDG_RMS_EPS);
+        sc = __shfl_sync(0xffffffff, sc, 0);
+        float ql[HEAD_DIM / WARP_SIZE];
+        #pragma unroll
+        for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
+            ql[j] = qh[i] * sc * __bfloat162float(__ldg(q_norm_weight + i));
+        #pragma unroll
+        for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
+            float cv = __bfloat162float(__ldg(cos_pos + i));
+            float sv = __bfloat162float(__ldg(sin_pos + i));
+            int po = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
+            int pi = i + po, pj = pi / WARP_SIZE;
+            float pv = __shfl_sync(0xffffffff, ql[pj], pi % WARP_SIZE);
+            qh[i] = (i < HEAD_DIM/2) ? ql[j]*cv - pv*sv : pv*sv + ql[j]*cv;
+        }
+    }
+
+    // Non-attention blocks: prefetch while QK norm runs above (overlapped work)
     if (block_id >= ATTN_BLOCKS) {
-        // Distribute prefetch work across non-attention blocks
-        // Weight sizes: O=2M, gate=3M, up=3M, down=3M (total 11M elements = 22 MB)
-        // 96 MB L2 can hold all of it
         int prefetch_block_id = block_id - ATTN_BLOCKS;
         int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
-
-        // Distribute proportionally: O gets 2/11, gate/up/down get 3/11 each
         int o_blocks = num_prefetch_blocks * 2 / 11;
         int gate_blocks = num_prefetch_blocks * 3 / 11;
         int up_blocks = num_prefetch_blocks * 3 / 11;
-        // down_blocks gets the remainder
         if (o_blocks < 1) o_blocks = 1;
 
         if (prefetch_block_id < o_blocks) {
-            // O projection: Q_SIZE x HIDDEN_SIZE = 2M elements
             int total = Q_SIZE * HIDDEN_SIZE;
-            int elems_per_block = (total + o_blocks - 1) / o_blocks;
-            int start = prefetch_block_id * elems_per_block;
-            int count = min(elems_per_block, total - start);
+            int epb = (total + o_blocks - 1) / o_blocks;
+            int start = prefetch_block_id * epb;
+            int count = min(epb, total - start);
             if (count > 0) ldg_prefetch_weights_l2(o_weight + start, count);
-        }
-        else if (prefetch_block_id < o_blocks + gate_blocks) {
-            // Gate projection: HIDDEN_SIZE x INTERMEDIATE_SIZE = 3M elements
-            int adjusted_id = prefetch_block_id - o_blocks;
+        } else if (prefetch_block_id < o_blocks + gate_blocks) {
+            int adj = prefetch_block_id - o_blocks;
             int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems_per_block = (total + gate_blocks - 1) / gate_blocks;
-            int start = adjusted_id * elems_per_block;
-            int count = min(elems_per_block, total - start);
+            int epb = (total + gate_blocks - 1) / gate_blocks;
+            int start = adj * epb;
+            int count = min(epb, total - start);
             if (count > 0) ldg_prefetch_weights_l2(gate_weight + start, count);
-        }
-        else if (prefetch_block_id < o_blocks + gate_blocks + up_blocks) {
-            // Up projection: same as gate
-            int adjusted_id = prefetch_block_id - o_blocks - gate_blocks;
+        } else if (prefetch_block_id < o_blocks + gate_blocks + up_blocks) {
+            int adj = prefetch_block_id - o_blocks - gate_blocks;
             int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems_per_block = (total + up_blocks - 1) / up_blocks;
-            int start = adjusted_id * elems_per_block;
-            int count = min(elems_per_block, total - start);
+            int epb = (total + up_blocks - 1) / up_blocks;
+            int start = adj * epb;
+            int count = min(epb, total - start);
             if (count > 0) ldg_prefetch_weights_l2(up_weight + start, count);
-        }
-        else {
-            // Down projection: INTERMEDIATE_SIZE x HIDDEN_SIZE = 3M elements
-            int adjusted_id = prefetch_block_id - o_blocks - gate_blocks - up_blocks;
-            int down_blocks = num_prefetch_blocks - o_blocks - gate_blocks - up_blocks;
+        } else {
+            int adj = prefetch_block_id - o_blocks - gate_blocks - up_blocks;
+            int db = num_prefetch_blocks - o_blocks - gate_blocks - up_blocks;
             int total = INTERMEDIATE_SIZE * HIDDEN_SIZE;
-            int elems_per_block = (total + down_blocks - 1) / down_blocks;
-            int start = adjusted_id * elems_per_block;
-            int count = min(elems_per_block, total - start);
+            int epb = (total + db - 1) / db;
+            int start = adj * epb;
+            int count = min(epb, total - start);
             if (count > 0) ldg_prefetch_weights_l2(down_weight + start, count);
         }
-
-        grid.sync();
-        return;
     }
+
+    // ALL blocks hit this sync: KV cache + Q norm complete, prefetch overlapped.
+    grid.sync();
 
     // Shared memory for cross-warp reduction of online softmax
     __shared__ float s_max_score[LDG_NUM_WARPS];
@@ -1458,28 +1509,12 @@ ldg_decode_kernel(
             t0 = clock64();
         }
 #endif
-        ldg_qk_norm_rope_cache(
-            grid, g_q, g_k, g_v,
-            w.q_norm_weight, w.k_norm_weight,
-            cos_table, sin_table,
-            layer_k_cache, layer_v_cache,
-            position, max_seq_len
-        );
-#if defined(LDG_PHASE_PROFILE)
-        if (is_prof) {
-            t1 = clock64();
-            g_phase_cycles[2] += (t1 - t0);
-        }
-#endif
-
-#if defined(LDG_PHASE_PROFILE)
-        if (is_prof) {
-            t0 = clock64();
-        }
-#endif
         ldg_attention(
-            grid, g_q, layer_k_cache, layer_v_cache, g_attn_out,
+            grid, g_q, g_k, g_v,
+            layer_k_cache, layer_v_cache, g_attn_out,
             cache_len, max_seq_len, attn_scale,
+            w.q_norm_weight, w.k_norm_weight,
+            cos_table, sin_table, position,
             w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
             w.down_proj_weight
         );
