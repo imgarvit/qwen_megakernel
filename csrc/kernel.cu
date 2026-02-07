@@ -106,8 +106,26 @@ __device__ __forceinline__ float ldg_warp_reduce_sum(float val) {
     return val;
 }
 
+constexpr float LOG2E = 1.44269504088896340736f;
+
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float y;
+    asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ float ptx_rcp(float x) {
+    float y;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ float fast_exp(float x) {
+    return ptx_exp2(x * LOG2E);
+}
+
 __device__ __forceinline__ float ldg_silu(float x) {
-    return x / (1.0f + __expf(-x));
+    return x * ptx_rcp(1.0f + fast_exp(-x));
 }
 
 #ifndef LDG_PREFETCH_L2_POLICY
@@ -700,10 +718,10 @@ __device__ void ldg_attention(
 
             float old_max = max_score;
             max_score = fmaxf(max_score, score);
-            float exp_diff = __expf(old_max - max_score);
-            sum_exp = sum_exp * exp_diff + __expf(score - max_score);
+            float exp_diff = fast_exp(old_max - max_score);
+            sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
 
-            float weight = __expf(score - max_score);
+            float weight = fast_exp(score - max_score);
 #if defined(LDG_ATTENTION_VEC4)
             uint2 v_u2 = __ldg(reinterpret_cast<const uint2*>(v_pos + q_idx));
             __nv_bfloat16* v_ptr = reinterpret_cast<__nv_bfloat16*>(&v_u2);
@@ -754,7 +772,7 @@ __device__ void ldg_attention(
 
             for (int w = 0; w < LDG_NUM_WARPS; w++) {
                 if (s_max_score[w] > -INFINITY) {  // Only consider warps that processed positions
-                    float scale = __expf(s_max_score[w] - global_max);
+                    float scale = fast_exp(s_max_score[w] - global_max);
                     total_sum_exp += s_sum_exp[w] * scale;
 
 #if defined(LDG_ATTENTION_VEC4)
