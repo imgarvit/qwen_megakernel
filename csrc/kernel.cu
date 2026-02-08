@@ -617,7 +617,11 @@ __device__ void ldg_attention(
     const __nv_bfloat16* __restrict__ o_weight,
     const __nv_bfloat16* __restrict__ gate_weight,
     const __nv_bfloat16* __restrict__ up_weight,
-    const __nv_bfloat16* __restrict__ down_weight
+    const __nv_bfloat16* __restrict__ down_weight,
+    // Lightweight flag syncs (independent of grid barrier). null = use grid.sync().
+    unsigned int* __restrict__ kv_flag = nullptr,    // block 0 signals KV cache ready
+    unsigned int* __restrict__ attn_flag = nullptr,  // attention blocks signal completion
+    int layer_idx = 0
 ) {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -723,8 +727,29 @@ __device__ void ldg_attention(
         }
     }
 
-    // ALL blocks hit this sync: KV cache + Q norm complete, prefetch overlapped.
-    grid.sync();
+    // --- Barrier #2: KV cache must be ready before attention ---
+    if (kv_flag) {
+        // All attention blocks need __syncthreads() to finish QK norm writes
+        if (block_id < ATTN_BLOCKS) {
+            __syncthreads();
+        }
+        // Block 0: signal KV cache is written (after intra-block sync)
+        if (block_id == 0 && threadIdx.x == 0) {
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            atomicExch(kv_flag, (unsigned int)(layer_idx + 1));
+        }
+        // Blocks 1-15: wait for KV cache
+        if (block_id > 0 && block_id < ATTN_BLOCKS) {
+            if (threadIdx.x == 0) {
+                volatile unsigned int* vf = (volatile unsigned int*)kv_flag;
+                while (*vf < (unsigned int)(layer_idx + 1)) {}
+            }
+            __syncthreads();
+        }
+        // Blocks 16-127: skip (they don't do attention)
+    } else {
+        grid.sync();
+    }
 
     // Shared memory for cross-warp reduction of online softmax
     __shared__ float s_max_score[LDG_NUM_WARPS];
@@ -867,7 +892,23 @@ __device__ void ldg_attention(
         __syncthreads();
     }
 
-    grid.sync();
+    // --- Barrier #3: attention output must be complete before O proj ---
+    if (attn_flag) {
+        // Attention blocks (0-15): signal completion
+        if (block_id < ATTN_BLOCKS) {
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            if (threadIdx.x == 0) atomicAdd(attn_flag, 1);
+        }
+        // ALL blocks wait for all 16 attention heads to finish
+        if (threadIdx.x == 0) {
+            unsigned int target = (unsigned int)(ATTN_BLOCKS * (layer_idx + 1));
+            volatile unsigned int* vf = (volatile unsigned int*)attn_flag;
+            while (*vf < target) {}
+        }
+        __syncthreads();
+    } else {
+        grid.sync();
+    }
 }
 
 // =============================================================================
@@ -2220,6 +2261,8 @@ ldg_decode_kernel_persistent(
     float* __restrict__ g_normalized,
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_sense,
+    unsigned int* __restrict__ kv_flag,
+    unsigned int* __restrict__ attn_flag,
     int num_layers,
     const int* __restrict__ d_position,
     const int* __restrict__ d_token_id,
@@ -2233,10 +2276,12 @@ ldg_decode_kernel_persistent(
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
 
-    // Reset barrier counters on-device (avoids host cudaMemsetAsync overhead)
+    // Reset barrier counters + flags on-device (avoids host cudaMemsetAsync)
     if (block_id == 0 && threadIdx.x == 0) {
         *barrier_counter = 0;
         *barrier_sense = 0;
+        atomicExch(kv_flag, 0u);
+        atomicExch(attn_flag, 0u);
     }
     // All blocks must see the reset before proceeding
     __syncthreads();
@@ -2251,6 +2296,8 @@ ldg_decode_kernel_persistent(
             volatile unsigned int* vg = (volatile unsigned int*)barrier_sense;
             while (*vg == 0) {}
         }
+        // Acquire fence: ensure all of block 0's resets (flags, counters) are visible
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
     __syncthreads();
 
@@ -2280,7 +2327,8 @@ ldg_decode_kernel_persistent(
             w.q_norm_weight, w.k_norm_weight,
             cos_table, sin_table, position,
             w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
-            w.down_proj_weight);
+            w.down_proj_weight,
+            kv_flag, attn_flag, layer);
 
         ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
             w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
@@ -2322,21 +2370,27 @@ ldg_decode_kernel_persistent(
 
 static unsigned int* d_barrier_counter = nullptr;
 static unsigned int* d_barrier_sense = nullptr;
+static unsigned int* d_kv_flag = nullptr;
+static unsigned int* d_attn_flag = nullptr;
 static int* d_mutable_position = nullptr;
 static int* d_mutable_token_id = nullptr;
-int* h_pinned_position = nullptr;  // pinned host memory for CUDA graph compat
+int* h_pinned_position = nullptr;
 int* h_pinned_token_id = nullptr;
 
 static void ensure_barrier_alloc() {
     if (!d_barrier_counter) {
         cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
         cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
+        cudaMalloc(&d_kv_flag, sizeof(unsigned int));
+        cudaMalloc(&d_attn_flag, sizeof(unsigned int));
         cudaMalloc(&d_mutable_position, sizeof(int));
         cudaMalloc(&d_mutable_token_id, sizeof(int));
         cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
         cudaHostAlloc(&h_pinned_token_id, sizeof(int), cudaHostAllocDefault);
         cudaMemset(d_barrier_counter, 0, sizeof(unsigned int));
         cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
+        cudaMemset(d_kv_flag, 0, sizeof(unsigned int));
+        cudaMemset(d_attn_flag, 0, sizeof(unsigned int));
     }
 }
 
@@ -2373,6 +2427,7 @@ extern "C" void launch_ldg_decode_persistent(
         (float*)g_q, (float*)g_k, (float*)g_v, (float*)g_attn_out,
         (float*)g_mlp_intermediate, (float*)g_normalized,
         d_barrier_counter, d_barrier_sense,
+        d_kv_flag, d_attn_flag,
         num_layers, d_mutable_position, d_mutable_token_id,
         max_seq_len, attn_scale);
 

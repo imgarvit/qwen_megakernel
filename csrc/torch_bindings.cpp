@@ -179,9 +179,10 @@ torch::Tensor generate_graph(
     int* d_out = static_cast<int*>(output_token.data_ptr());
     int* h_result = static_cast<int*>(result.data_ptr());
 
-    // Warmup (ensures all allocations are done)
     int tok = static_cast<int>(first_token_id);
     int pos = static_cast<int>(start_position);
+
+    // Warmup: ensure all lazy allocations complete before capture
     launch_ldg_decode_persistent(tok, d_out,
         embed_weight.data_ptr(),
         reinterpret_cast<const LDGLayerWeights*>(layer_weights_packed.data_ptr()),
@@ -196,10 +197,11 @@ torch::Tensor generate_graph(
         static_cast<int>(max_seq_len), static_cast<float>(attn_scale), stream);
     cudaStreamSynchronize(stream);
 
-    // Capture graph
-    cudaGraph_t graph;
-    cudaGraphExec_t graph_exec;
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    // Capture the decode step as a CUDA graph on a fresh stream
+    cudaStream_t capture_stream;
+    cudaStreamCreate(&capture_stream);
+
+    // Warmup on capture stream too
     launch_ldg_decode_persistent(tok, d_out,
         embed_weight.data_ptr(),
         reinterpret_cast<const LDGLayerWeights*>(layer_weights_packed.data_ptr()),
@@ -211,22 +213,59 @@ torch::Tensor generate_graph(
         mlp_intermediate.data_ptr(), normalized.data_ptr(),
         block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
         static_cast<int>(num_layers), pos, pos + 1,
-        static_cast<int>(max_seq_len), static_cast<float>(attn_scale), stream);
-    cudaStreamEndCapture(stream, &graph);
+        static_cast<int>(max_seq_len), static_cast<float>(attn_scale), capture_stream);
+    cudaStreamSynchronize(capture_stream);
+
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+
+    cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+    launch_ldg_decode_persistent(tok, d_out,
+        embed_weight.data_ptr(),
+        reinterpret_cast<const LDGLayerWeights*>(layer_weights_packed.data_ptr()),
+        final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+        cos_table.data_ptr(), sin_table.data_ptr(),
+        k_cache.data_ptr(), v_cache.data_ptr(),
+        hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), attn_out.data_ptr(),
+        mlp_intermediate.data_ptr(), normalized.data_ptr(),
+        block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+        static_cast<int>(num_layers), pos, pos + 1,
+        static_cast<int>(max_seq_len), static_cast<float>(attn_scale), capture_stream);
+    auto err = cudaStreamEndCapture(capture_stream, &graph);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(capture_stream);
+        // Fallback: non-graph generation
+        for (int step = 0; step < num_steps; step++) {
+            launch_ldg_decode_persistent(tok, d_out,
+                embed_weight.data_ptr(),
+                reinterpret_cast<const LDGLayerWeights*>(layer_weights_packed.data_ptr()),
+                final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+                cos_table.data_ptr(), sin_table.data_ptr(),
+                k_cache.data_ptr(), v_cache.data_ptr(),
+                hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), attn_out.data_ptr(),
+                mlp_intermediate.data_ptr(), normalized.data_ptr(),
+                block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+                static_cast<int>(num_layers), pos, pos + 1,
+                static_cast<int>(max_seq_len), static_cast<float>(attn_scale), stream);
+            cudaMemcpyAsync(&h_result[step], d_out, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            tok = h_result[step];
+            pos++;
+        }
+        return result;
+    }
+
     cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 
-    // Generate tokens using graph replay
-    tok = static_cast<int>(first_token_id);
-    pos = static_cast<int>(start_position);
+    // Generate with graph replay
     for (int step = 0; step < num_steps; step++) {
-        // Update pinned memory (graph will memcpy these to device)
+        // Update pinned host memory; graph's captured memcpy re-reads from these addrs
         *h_pinned_token_id = tok;
         *h_pinned_position = pos;
 
-        // Replay graph
         cudaGraphLaunch(graph_exec, stream);
-
-        // Copy output token back
         cudaMemcpyAsync(&h_result[step], d_out, sizeof(int), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
         tok = h_result[step];
@@ -235,6 +274,7 @@ torch::Tensor generate_graph(
 
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
+    cudaStreamDestroy(capture_stream);
 
     return result;
 }
