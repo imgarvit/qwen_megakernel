@@ -15,7 +15,7 @@ KV_SIZE = 8 * HEAD_DIM      # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
-_decode = torch.ops.qwen_megakernel_C.decode_persistent
+_decode = torch.ops.qwen_megakernel_C.decode
 
 
 def load_weights(model_name="Qwen/Qwen3-0.6B"):
@@ -24,7 +24,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B"):
 
     print(f"Loading {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
+        model_name, dtype=torch.bfloat16, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
