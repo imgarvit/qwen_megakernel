@@ -3,10 +3,10 @@
 This megakernel is aggressively optimized for Qwen3-0.6B (bf16) shapes to be run on an RTX 5090. It still needs a lot of work, and is only really fast in specific scenarios.
 
 
-| Backend      | tok/s | ms/tok | Speedup |
-|--------------|-------|--------|---------|
-| PyTorch (HF) | 123.3 | 8.11   | 1.00x   |
-| Megakernel   | 907.4 | 1.10   | 7.35x   |
+| Backend      | tok/s  | ms/tok | Speedup |
+|--------------|--------|--------|---------|
+| PyTorch (HF) | 123.3  | 8.11   | 1.00x   |
+| Megakernel   | 1000.2 | 1.00   | 8.11x   |
 
 
 To use this:

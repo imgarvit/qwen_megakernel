@@ -899,7 +899,33 @@ __device__ void ldg_attention(
             asm volatile("fence.acq_rel.gpu;" ::: "memory");
             if (threadIdx.x == 0) atomicAdd(attn_flag, 1);
         }
-        // ALL blocks wait for all 16 attention heads to finish
+        // Non-attention blocks: prefetch O+gate+up weights while waiting
+        // (refreshes L2 so O proj + MLP reads hit L2 instead of DRAM)
+        if (block_id >= ATTN_BLOCKS && threadIdx.x != 0) {
+            int prefetch_id = block_id - ATTN_BLOCKS;
+            int npb = num_blocks - ATTN_BLOCKS;  // 112 blocks
+            // Split: ~20% O proj, ~40% gate, ~40% up (proportional to size)
+            int o_total = Q_SIZE * HIDDEN_SIZE;              // ~2M
+            int g_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;  // ~3M
+            int u_total = g_total;                          // ~3M
+            int d_total = INTERMEDIATE_SIZE * HIDDEN_SIZE;  // ~3M
+            int all_total = o_total + g_total + u_total + d_total;  // ~11M
+            int per = (all_total + npb - 1) / npb;
+            int s = prefetch_id * per, e = min(s + per, all_total);
+            for (int i = s + (threadIdx.x-1); i < e; i += LDG_BLOCK_SIZE-1) {
+                const __nv_bfloat16* ptr;
+                if (i < o_total)
+                    ptr = o_weight + i;
+                else if (i < o_total + g_total)
+                    ptr = gate_weight + (i - o_total);
+                else if (i < o_total + g_total + u_total)
+                    ptr = up_weight + (i - o_total - g_total);
+                else
+                    ptr = down_weight + (i - o_total - g_total - u_total);
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr));
+            }
+        }
+        // Thread 0: wait for all 16 attention heads to finish
         if (threadIdx.x == 0) {
             unsigned int target = (unsigned int)(ATTN_BLOCKS * (layer_idx + 1));
             volatile unsigned int* vf = (volatile unsigned int*)attn_flag;
