@@ -45,6 +45,27 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #ifndef LDG_ATTN_BLOCKS
 #define LDG_ATTN_BLOCKS NUM_Q_HEADS
 #endif
+#ifndef LDG_PREFETCH_QK
+#define LDG_PREFETCH_QK 1
+#endif
+#ifndef LDG_PREFETCH_DOWN
+#define LDG_PREFETCH_DOWN 1
+#endif
+#ifndef LDG_PREFETCH_THREAD_STRIDE
+#define LDG_PREFETCH_THREAD_STRIDE 1
+#endif
+#ifndef LDG_PREFETCH_ELEM_STRIDE
+#define LDG_PREFETCH_ELEM_STRIDE 1
+#endif
+#ifndef LDG_PREFETCH_BLOCK_STRIDE
+#define LDG_PREFETCH_BLOCK_STRIDE 1
+#endif
+#ifndef LDG_PREFETCH_GATE
+#define LDG_PREFETCH_GATE 1
+#endif
+#ifndef LDG_PREFETCH_UP
+#define LDG_PREFETCH_UP 1
+#endif
 
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
@@ -390,7 +411,7 @@ __device__ void ldg_attention(
   }
 
   // Non-attention blocks: prefetch while QK norm runs above (overlapped work)
-  if (block_id >= ATTN_BLOCKS) {
+  if (LDG_PREFETCH_QK && block_id >= ATTN_BLOCKS) {
     int prefetch_block_id = block_id - ATTN_BLOCKS;
     int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
     int o_blocks = num_prefetch_blocks * 2 / 11;
@@ -578,28 +599,34 @@ __device__ void ldg_attention(
     }
     // Non-attention blocks: prefetch O+gate+up weights while waiting
     // (refreshes L2 so O proj + MLP reads hit L2 instead of DRAM)
-    if (block_id >= ATTN_BLOCKS && threadIdx.x != 0) {
+    if (block_id >= ATTN_BLOCKS && threadIdx.x != 0 &&
+        (threadIdx.x % LDG_PREFETCH_THREAD_STRIDE == 0)) {
       int prefetch_id = block_id - ATTN_BLOCKS;
-      int npb = num_blocks - ATTN_BLOCKS; // 112 blocks
-      // Split: ~20% O proj, ~40% gate, ~40% up (proportional to size)
-      int o_total = Q_SIZE * HIDDEN_SIZE;                    // ~2M
-      int g_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;         // ~3M
-      int u_total = g_total;                                 // ~3M
-      int d_total = INTERMEDIATE_SIZE * HIDDEN_SIZE;         // ~3M
-      int all_total = o_total + g_total + u_total + d_total; // ~11M
-      int per = (all_total + npb - 1) / npb;
-      int s = prefetch_id * per, e = min(s + per, all_total);
-      for (int i = s + (threadIdx.x - 1); i < e; i += LDG_BLOCK_SIZE - 1) {
-        const __nv_bfloat16 *ptr;
-        if (i < o_total)
-          ptr = o_weight + i;
-        else if (i < o_total + g_total)
-          ptr = gate_weight + (i - o_total);
-        else if (i < o_total + g_total + u_total)
-          ptr = up_weight + (i - o_total - g_total);
-        else
-          ptr = down_weight + (i - o_total - g_total - u_total);
-        asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr));
+      if (prefetch_id % LDG_PREFETCH_BLOCK_STRIDE != 0) {
+        // Skip this block's prefetch work.
+      } else {
+        int npb = num_blocks - ATTN_BLOCKS; // 112 blocks
+        // Split: ~20% O proj, ~40% gate, ~40% up (proportional to size)
+        int o_total = Q_SIZE * HIDDEN_SIZE; // ~2M
+        int g_total = LDG_PREFETCH_GATE ? (HIDDEN_SIZE * INTERMEDIATE_SIZE) : 0;
+        int u_total = LDG_PREFETCH_UP ? (HIDDEN_SIZE * INTERMEDIATE_SIZE) : 0;
+        int d_total = LDG_PREFETCH_DOWN ? (INTERMEDIATE_SIZE * HIDDEN_SIZE) : 0;
+        int all_total = o_total + g_total + u_total + d_total; // ~11M
+        int per = (all_total + npb - 1) / npb;
+        int s = prefetch_id * per, e = min(s + per, all_total);
+        int step = (LDG_BLOCK_SIZE - 1) * LDG_PREFETCH_ELEM_STRIDE;
+        for (int i = s + (threadIdx.x - 1); i < e; i += step) {
+          const __nv_bfloat16 *ptr;
+          if (i < o_total)
+            ptr = o_weight + i;
+          else if (i < o_total + g_total)
+            ptr = gate_weight + (i - o_total);
+          else if (i < o_total + g_total + u_total)
+            ptr = up_weight + (i - o_total - g_total);
+          else
+            ptr = down_weight + (i - o_total - g_total - u_total);
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr));
+        }
       }
     }
     // Thread 0: wait for all 16 attention heads to finish

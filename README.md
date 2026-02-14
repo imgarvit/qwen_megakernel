@@ -8,7 +8,7 @@ More details on this blogpost: https://blog.alpindale.net/posts/5090_decode_opti
 | Backend      | tok/s  | ms/tok | Speedup |
 |--------------|--------|--------|---------|
 | PyTorch (HF) | 123.3  | 8.11   | 1.00x   |
-| Megakernel   | 1032.1 | 0.99   | 8.37x   |
+| Megakernel   | 1036.3 | 0.99   | 8.40x   |
 
 
 To use this:
