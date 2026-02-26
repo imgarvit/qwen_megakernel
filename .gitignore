@@ -39,3 +39,10 @@ Thumbs.db
 *.bin
 *.safetensors
 .ref/
+
+# Audio samples (generated, not tracked)
+*.wav
+
+# Debug/diagnostic scripts
+diagnose_tokens.py
+check_config.py

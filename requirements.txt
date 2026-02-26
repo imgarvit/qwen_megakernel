@@ -1,5 +1,9 @@
-torch>=2.0.0
-transformers>=4.40.0
-triton>=2.2.0
-ninja
-accelerate
+# GPU server dependencies (RTX 5090 / sm_120 / CUDA 12.8+)
+# Install with: pip install -r requirements.txt
+torch>=2.10.0
+qwen-tts>=0.1.1
+transformers>=4.57.0
+websockets>=16.0
+soundfile>=0.13.0
+numpy>=2.0
+librosa>=0.11.0

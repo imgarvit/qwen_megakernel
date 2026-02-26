@@ -1,0 +1,5 @@
+# Install on your LOCAL machine (not the GPU instance)
+pipecat-ai[openai,silero]
+websockets
+numpy
+soundfile
