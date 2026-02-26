@@ -75,8 +75,8 @@ class TTSServer:
                     continue
 
                 language = msg.get("language", "English")
-                temperature = float(msg.get("temperature", 0.7))
-                top_k = int(msg.get("top_k", 30))
+                temperature = float(msg.get("temperature", 0.9))
+                top_k = int(msg.get("top_k", 50))
                 chunk_tokens = int(msg.get("chunk_tokens", 8))
                 speaker_ref = msg.get("speaker_ref", self._default_speaker_ref)
 

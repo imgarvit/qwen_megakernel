@@ -35,8 +35,8 @@ class MegakernelTTSService(TTSService):
         ws_url: str = "ws://localhost:8765",
         language: str = "English",
         speaker_ref: str | None = None,
-        temperature: float = 0.7,
-        top_k: int = 30,
+        temperature: float = 0.9,
+        top_k: int = 50,
         chunk_tokens: int = 8,
         **kwargs,
     ):
