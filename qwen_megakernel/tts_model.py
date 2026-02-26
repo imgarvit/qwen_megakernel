@@ -676,11 +676,23 @@ class TTSDecoder:
         new_wav = wav[0, 0, skip:]
         return new_wav.detach().float().cpu().numpy()
 
+    def extract_speaker_embedding(self, wav_path: str):
+        """Extract and return a cached speaker embedding tensor from a WAV file."""
+        import librosa
+        wav, sr = librosa.load(wav_path, sr=None, mono=True)
+        target_sr = self._tts_model.model.speaker_encoder_sample_rate
+        if sr != target_sr:
+            wav = librosa.resample(y=wav, orig_sr=sr, target_sr=target_sr)
+        return self._tts_model.model.extract_speaker_embedding(
+            audio=wav, sr=target_sr
+        )
+
     def generate_speech_streaming(
         self,
         text: str,
         language: str = "English",
         speaker_ref: Optional[str] = None,
+        spk_embed=None,
         chunk_tokens: int = 4,
         first_chunk_tokens: int = 4,
         max_tokens: int = 2048,
@@ -693,6 +705,9 @@ class TTSDecoder:
         Yields numpy arrays of float32 audio at 24 kHz.
         First chunk uses `first_chunk_tokens` (default 1) for fast TTFC,
         subsequent chunks use `chunk_tokens` for throughput.
+
+        For voice consistency, pass a pre-extracted `spk_embed` tensor
+        (from extract_speaker_embedding) instead of `speaker_ref` path.
         """
         import time as _time
         _t0 = _time.perf_counter()
@@ -710,17 +725,9 @@ class TTSDecoder:
         _log(f"Tokenized: {input_ids.shape[1]} tokens")
 
         # --- Speaker embedding (for voice cloning) ---
-        spk_embed = None
-        if speaker_ref is not None:
+        if spk_embed is None and speaker_ref is not None:
             try:
-                import librosa
-                wav, sr = librosa.load(speaker_ref, sr=None, mono=True)
-                target_sr = self._tts_model.model.speaker_encoder_sample_rate
-                if sr != target_sr:
-                    wav = librosa.resample(y=wav, orig_sr=sr, target_sr=target_sr)
-                spk_embed = self._tts_model.model.extract_speaker_embedding(
-                    audio=wav, sr=target_sr
-                )
+                spk_embed = self.extract_speaker_embedding(speaker_ref)
             except Exception:
                 pass
 

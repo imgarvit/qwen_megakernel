@@ -29,9 +29,11 @@ class TTSServer:
     def __init__(self, speaker_ref: str | None = None):
         print("Loading TTSDecoder...")
         self._decoder = TTSDecoder()
-        self._default_speaker_ref = speaker_ref
+        self._cached_spk_embed = None
         if speaker_ref:
-            print(f"Default speaker reference: {speaker_ref}")
+            print(f"Extracting speaker embedding from: {speaker_ref}")
+            self._cached_spk_embed = self._decoder.extract_speaker_embedding(speaker_ref)
+            print(f"Speaker embedding cached (shape={self._cached_spk_embed.shape})")
         print("TTSDecoder ready.")
 
     async def _listen_for_cancel(self, websocket):
@@ -79,13 +81,6 @@ class TTSServer:
                 temperature = float(msg.get("temperature", 0.9))
                 top_k = int(msg.get("top_k", 50))
                 chunk_tokens = int(msg.get("chunk_tokens", 8))
-                speaker_ref = msg.get("speaker_ref", self._default_speaker_ref)
-                seed = msg.get("seed")
-
-                if seed is not None:
-                    torch.manual_seed(int(seed))
-                    torch.cuda.manual_seed(int(seed))
-
                 print(f"[{remote}] TTS: {text[:60]}...")
                 t0 = time.perf_counter()
                 ttfc = None
@@ -97,7 +92,7 @@ class TTSServer:
                 for audio_chunk in self._decoder.generate_speech_streaming(
                     text,
                     language=language,
-                    speaker_ref=speaker_ref,
+                    spk_embed=self._cached_spk_embed,
                     temperature=temperature,
                     top_k=top_k,
                     chunk_tokens=chunk_tokens,
