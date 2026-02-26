@@ -4,6 +4,11 @@ Pipecat TTS service that connects to the remote Megakernel TTS WebSocket server.
 Runs on your LOCAL machine as part of the Pipecat pipeline.
 The GPU instance runs server.py and does the actual TTS inference.
 
+Voice consistency: A fixed seed is sent with every request so that the server
+pins torch's random state before each generation.  This anchors the voice
+timbre / pitch across sentence-level chunks without sacrificing streaming
+latency.
+
 Usage:
     tts = MegakernelTTSService(ws_url="ws://<gpu-instance-ip>:8765")
     pipeline = Pipeline([..., tts, ...])
@@ -38,6 +43,7 @@ class MegakernelTTSService(TTSService):
         temperature: float = 0.9,
         top_k: int = 50,
         chunk_tokens: int = 8,
+        voice_seed: int = 42,
         **kwargs,
     ):
         super().__init__(sample_rate=24000, **kwargs)
@@ -47,6 +53,7 @@ class MegakernelTTSService(TTSService):
         self._temperature = temperature
         self._top_k = top_k
         self._chunk_tokens = chunk_tokens
+        self._voice_seed = voice_seed
         self._ws = None
         self._generating = False
 
@@ -91,6 +98,7 @@ class MegakernelTTSService(TTSService):
                 "temperature": self._temperature,
                 "top_k": self._top_k,
                 "chunk_tokens": self._chunk_tokens,
+                "seed": self._voice_seed,
             }
             if self._speaker_ref:
                 request["speaker_ref"] = self._speaker_ref

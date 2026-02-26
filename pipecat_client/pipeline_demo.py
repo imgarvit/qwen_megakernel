@@ -96,7 +96,7 @@ async def main():
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            allow_interruptions=False,
             enable_metrics=True,
         ),
     )

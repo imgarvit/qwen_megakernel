@@ -19,6 +19,7 @@ import struct
 import time
 
 import numpy as np
+import torch
 import websockets
 
 from qwen_megakernel.tts_model import TTSDecoder
@@ -79,6 +80,11 @@ class TTSServer:
                 top_k = int(msg.get("top_k", 50))
                 chunk_tokens = int(msg.get("chunk_tokens", 8))
                 speaker_ref = msg.get("speaker_ref", self._default_speaker_ref)
+                seed = msg.get("seed")
+
+                if seed is not None:
+                    torch.manual_seed(int(seed))
+                    torch.cuda.manual_seed(int(seed))
 
                 print(f"[{remote}] TTS: {text[:60]}...")
                 t0 = time.perf_counter()
