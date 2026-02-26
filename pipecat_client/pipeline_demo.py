@@ -54,8 +54,8 @@ async def main():
     tts = MegakernelTTSService(
         ws_url=ws_url,
         speaker_ref=speaker_ref,
-        temperature=0.9,
-        top_k=50,
+        temperature=0.3,
+        top_k=15,
     )
 
     transport = LocalAudioTransport(
@@ -96,7 +96,7 @@ async def main():
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=False,
+            allow_interruptions=True,
             enable_metrics=True,
         ),
     )

@@ -4,10 +4,12 @@ Pipecat TTS service that connects to the remote Megakernel TTS WebSocket server.
 Runs on your LOCAL machine as part of the Pipecat pipeline.
 The GPU instance runs server.py and does the actual TTS inference.
 
-Voice consistency: A fixed seed is sent with every request so that the server
-pins torch's random state before each generation.  This anchors the voice
-timbre / pitch across sentence-level chunks without sacrificing streaming
-latency.
+Interruption flow (matches ElevenLabs WSS pattern):
+  1. VAD detects user speaking → Pipecat sends InterruptionFrame
+  2. _handle_interruption sets _interrupt_event
+  3. run_tts sees the event, sends {"cancel": true} to GPU, drains remaining msgs
+  4. GPU stops decode loop immediately, replies {"cancelled": true}
+  5. TTS is ready for the next sentence — WebSocket stays alive
 
 Usage:
     tts = MegakernelTTSService(ws_url="ws://<gpu-instance-ip>:8765")
@@ -16,7 +18,6 @@ Usage:
 
 import asyncio
 import json
-import struct
 from typing import AsyncGenerator
 
 import numpy as np
@@ -24,10 +25,12 @@ import websockets
 
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTSService
 
 
@@ -39,27 +42,28 @@ class MegakernelTTSService(TTSService):
         *,
         ws_url: str = "ws://localhost:8765",
         language: str = "English",
-        speaker_ref: str | None = None,
         temperature: float = 0.9,
         top_k: int = 50,
         chunk_tokens: int = 8,
-        voice_seed: int = 42,
         **kwargs,
     ):
         super().__init__(sample_rate=24000, **kwargs)
         self._ws_url = ws_url
         self._language = language
-        self._speaker_ref = speaker_ref
         self._temperature = temperature
         self._top_k = top_k
         self._chunk_tokens = chunk_tokens
-        self._voice_seed = voice_seed
         self._ws = None
         self._generating = False
+        self._interrupt_event = asyncio.Event()
 
     async def _ensure_connected(self):
         try:
-            is_closed = self._ws is None or getattr(self._ws, 'closed', False) or self._ws.state.name == "CLOSED"
+            is_closed = (
+                self._ws is None
+                or getattr(self._ws, "closed", False)
+                or self._ws.state.name == "CLOSED"
+            )
         except Exception:
             is_closed = True
         if is_closed:
@@ -70,23 +74,32 @@ class MegakernelTTSService(TTSService):
                 ping_timeout=60,
             )
 
-    async def _flush(self):
-        """Cancel any in-flight generation on the server."""
-        if self._generating and self._ws:
-            try:
-                await self._ws.send(json.dumps({"cancel": True}))
-                async for msg in self._ws:
-                    if isinstance(msg, str):
-                        data = json.loads(msg)
-                        if data.get("done") or data.get("cancelled"):
-                            break
-            except Exception:
-                self._ws = None
-            self._generating = False
+    async def _send_cancel_and_drain(self):
+        """Send cancel to the GPU and drain until ack. Keeps WS alive."""
+        if not self._ws:
+            return
+        try:
+            await self._ws.send(json.dumps({"cancel": True}))
+            async for msg in self._ws:
+                if isinstance(msg, str):
+                    data = json.loads(msg)
+                    if data.get("done") or data.get("cancelled"):
+                        break
+        except Exception:
+            self._ws = None
+        self._generating = False
+
+    async def _handle_interruption(
+        self, frame: InterruptionFrame, direction: FrameDirection
+    ):
+        """Called by Pipecat when VAD detects the user speaking mid-utterance."""
+        self._interrupt_event.set()
+        await super()._handle_interruption(frame, direction)
 
     async def run_tts(
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame, None]:
+        self._interrupt_event.clear()
         yield TTSStartedFrame(context_id=context_id)
 
         try:
@@ -98,17 +111,36 @@ class MegakernelTTSService(TTSService):
                 "temperature": self._temperature,
                 "top_k": self._top_k,
                 "chunk_tokens": self._chunk_tokens,
-                "seed": self._voice_seed,
             }
-            if self._speaker_ref:
-                request["speaker_ref"] = self._speaker_ref
             await self._ws.send(json.dumps(request))
             self._generating = True
 
-            async for msg in self._ws:
+            while True:
+                if self._interrupt_event.is_set():
+                    await self._send_cancel_and_drain()
+                    break
+
+                recv_task = asyncio.ensure_future(self._ws.recv())
+                interrupt_task = asyncio.ensure_future(self._interrupt_event.wait())
+
+                done, pending = await asyncio.wait(
+                    {recv_task, interrupt_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+
+                if interrupt_task in done:
+                    recv_task.cancel()
+                    await self._send_cancel_and_drain()
+                    break
+
+                msg = recv_task.result()
                 if isinstance(msg, bytes):
                     audio = np.frombuffer(msg, dtype=np.float32)
-                    pcm_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+                    pcm_int16 = (
+                        (audio * 32767).clip(-32768, 32767).astype(np.int16)
+                    )
                     yield TTSAudioRawFrame(
                         audio=pcm_int16.tobytes(),
                         sample_rate=24000,
@@ -118,13 +150,17 @@ class MegakernelTTSService(TTSService):
                 elif isinstance(msg, str):
                     data = json.loads(msg)
                     if data.get("done"):
+                        self._generating = False
                         break
                     if data.get("error"):
                         print(f"[MegakernelTTS] error: {data['error']}")
+                        self._generating = False
                         break
 
-            self._generating = False
-
+        except asyncio.CancelledError:
+            if self._generating:
+                await self._send_cancel_and_drain()
+            raise
         except Exception as e:
             print(f"[MegakernelTTS] connection error: {e}")
             self._ws = None
