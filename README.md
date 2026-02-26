@@ -226,13 +226,19 @@ qwen_megakernel/
 └── README.md
 ```
 
+## Demo
+
+- **Audio recording** (60s conversation): [demo.wav](https://drive.google.com/file/d/1Ie9L825tYxvaza__v2Nj-1vBV9Uvu5xR/view?usp=sharing)
+- **Video recording** (screen + terminal logs): [IMG_4764.MOV](https://drive.google.com/file/d/1fwbMg4ZMd_AYuYfzX6IdAvDzbavhPbWT/view?usp=sharing)
+
+> The video was recorded with headphone output, so speaker playback is not captured on screen — the audio recording has both sides of the conversation and syncs with the video at ~1:30.
+
 ## Known Limitations
 
-1. **Repetition at long utterances** — Codebook-0 token can enter repetition loops on long sentences. Mitigated by early-stop detection (30-repeat threshold).
-2. **`torch.compile` warmup** — First server start takes ~30s for tracing. Subsequent calls are fast.
-3. **Single-request processing** — Both modes handle one TTS request at a time. Concurrent requests queue.
-4. **RTX 5090 only** — The kernel is compiled for sm_120 (Blackwell). It will not run on older GPUs.
-5. **OpenAI dependency** — STT (Whisper) and LLM (GPT-4o-mini) require an OpenAI API key.
+1. **`torch.compile` warmup** — First server start takes ~30s for tracing. Subsequent calls are fast.
+2. **Single-request processing** — Both modes handle one TTS request at a time. Concurrent requests queue.
+3. **RTX 5090 only** — The kernel is compiled for sm_120 (Blackwell). It will not run on older GPUs.
+4. **OpenAI dependency** — STT (Whisper) and LLM (GPT-4o-mini) require an OpenAI API key.
 
 ## Credits
 

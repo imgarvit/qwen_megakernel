@@ -54,6 +54,8 @@ from pipecat.transports.websocket.server import (
     WebsocketServerTransport,
 )
 
+from pipecat.audio.vad.vad_analyzer import VADParams
+
 try:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
 except ImportError:
@@ -121,6 +123,7 @@ class DirectMegakernelTTSService(TTSService):
     async def _handle_interruption(
         self, frame: InterruptionFrame, direction: FrameDirection
     ):
+        print("[DirectTTS] Interruption received — cancelling generation")
         self._decoder.cancel()
         await super()._handle_interruption(frame, direction)
 
@@ -212,7 +215,14 @@ async def main(host: str, port: int, speaker_ref: Optional[str], openai_key: str
             audio_in_sample_rate=16000,
             audio_out_sample_rate=24000,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer() if SileroVADAnalyzer else None,
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    confidence=0.5,
+                    start_secs=0.15,
+                    stop_secs=0.3,
+                    min_volume=0.2,
+                )
+            ) if SileroVADAnalyzer else None,
             serializer=RawPCMSerializer(sample_rate_in=16000),
         ),
     )
