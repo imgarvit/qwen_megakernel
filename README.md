@@ -1,8 +1,36 @@
 # Qwen3-TTS Megakernel — RTX 5090 Decode Backend for Pipecat
 
-A CUDA megakernel implementation of the Qwen3-TTS talker decoder, adapted from [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), wired into a Pipecat voice agent pipeline via WebSocket streaming.
+A CUDA megakernel implementation of the Qwen3-TTS talker decoder, adapted from [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), wired into a real-time Pipecat voice agent pipeline.
 
 ## Architecture
+
+Two deployment modes are supported:
+
+### GPU-Only Pipeline (Recommended)
+
+Everything runs on the GPU. The local machine only handles mic/speaker I/O.
+
+```
+LOCAL MACHINE                              VAST.AI RTX 5090
+┌───────────────────┐                      ┌──────────────────────────────────────┐
+│  audio_client.py  │                      │  gpu_pipeline.py (Pipecat + TTS)    │
+│                   │                      │                                      │
+│  Mic ─────────────┼──PCM 16kHz──►        │  VAD → STT → LLM → DirectTTS       │
+│                   │                      │                     │                │
+│  Speaker ◄────────┼──PCM 24kHz──         │    ┌────────────────┘                │
+│                   │                      │    │ TTSDecoder (direct, no WS hop)  │
+│  (pyaudio + WS)   │                      │    │  ├─ Megakernel (28-layer        │
+│                   │                      │    │  │  Qwen3 backbone, CUDA)       │
+└───────────────────┘                      │    │  ├─ Code Predictor (5-layer)    │
+         ▲                                 │    │  └─ Speech Tokenizer (CUDA)     │
+         │  SSH tunnel :8766               │    └─ Speaker Embedding (cached)     │
+         └─────────────────────────────────┘                                      │
+                                           └──────────────────────────────────────┘
+```
+
+### Split Mode (Alternative)
+
+Pipecat runs locally with STT/LLM; the GPU runs only the TTS server.
 
 ```
 LOCAL MACHINE                              VAST.AI RTX 5090
@@ -10,23 +38,17 @@ LOCAL MACHINE                              VAST.AI RTX 5090
 │  Pipecat Pipeline         │              │  server.py (WebSocket :8765)    │
 │                           │              │                                 │
 │  Mic → STT → LLM ────────┼──text──►     │  TTSDecoder                     │
-│                    ◄──────┼──PCM───      │    ├─ Megakernel (28-layer      │
-│              → Speaker    │  chunks      │    │  Qwen3 backbone, CUDA)     │
-│                           │              │    ├─ Code Predictor (5-layer)  │
-│  MegakernelTTSService     │              │    └─ Speech Tokenizer          │
-│  (WebSocket client)       │              │       (CUDA-graphed decoder)    │
+│                    ◄──────┼──PCM───      │    ├─ Megakernel backbone       │
+│              → Speaker    │  chunks      │    ├─ Code Predictor            │
+│                           │              │    └─ Speech Tokenizer          │
+│  MegakernelTTSService     │              │                                 │
+│  (WebSocket client)       │              │  Speaker embedding cached once  │
 └───────────────────────────┘              └─────────────────────────────────┘
 ```
 
-### Why This Split?
-
-- **GPU instance** runs `server.py` — loads the model once, accepts WebSocket connections, streams PCM audio frame-by-frame. The megakernel requires an RTX 5090 (sm_120) and CUDA 12.8+.
-- **Local machine** runs a Pipecat pipeline with `MegakernelTTSService` — a custom TTS service that connects to the remote WebSocket. No GPU needed locally.
-- **Single repo** keeps everything together for ease of review and deployment. The split is at the network boundary, not the repo boundary.
-
 ## What the Megakernel Does
 
-The original `qwen_megakernel` runs Qwen3-0.6B decode at ~1,154 tok/s on a single RTX 5090 using a persistent CUDA kernel (128 blocks x 512 threads). This project adapts it for **Qwen3-TTS-12Hz-0.6B-Base** — the talker decoder stage of Qwen3-TTS.
+The original `qwen_megakernel` runs Qwen3-0.6B decode at ~1,154 tok/s on a single RTX 5090 using a persistent CUDA kernel (128 blocks × 512 threads). This project adapts it for **Qwen3-TTS-12Hz-0.6B-Base** — the talker decoder stage of Qwen3-TTS.
 
 ### Kernel Modifications for TTS
 
@@ -41,85 +63,124 @@ The original `qwen_megakernel` runs Qwen3-0.6B decode at ~1,154 tok/s on a singl
 
 ### TTS Pipeline (per decode step)
 
-Each decode step produces 80ms of audio (12.5 tokens/second at 24kHz):
+Each decode step produces 80 ms of audio (12.5 tokens/second at 24 kHz):
 
 1. **Megakernel backbone** — 28 transformer layers → codebook-0 token + hidden state (~0.87 ms)
-2. **Code predictor** — 5-layer transformer, 15 autoregressive steps → codebooks 1-15 (~52 ms)
-3. **Speech tokenizer decoder** — 16-codebook tokens → audio waveform (~33 ms, pipelined on separate CUDA stream)
-
-### Optimizations Applied
-
-| Optimization | Before | After | Impact |
-|-------------|--------|-------|--------|
-| Megakernel for backbone | PyTorch forward | Single CUDA kernel | 1,147 tok/s decode |
-| Megakernel for code predictor | HF `generate()` (~137 ms) | Manual loop + kernel (~52 ms) | 2.6x speedup |
-| `torch.compile` on code predictor | ~130 ms/step | ~52 ms/step | 2.5x |
-| Chunked decode with 25-frame left context | O(n) growing window | O(1) constant ~33 ms | Linear → constant |
-| Pipelined decode on separate CUDA stream | Sequential | Overlapped | ~33 ms hidden |
-| CUDA graphs for speech tokenizer | PyTorch dispatch overhead | Single graph replay | Faster decode |
-| Pre-cached special token embeddings | Recomputed per call | Cached at init | ~10 ms saved |
-| Pre-computed suppress mask | Python loop per step | Single GPU tensor | ~15 ms saved |
+2. **Code predictor** — 5-layer transformer, 3 autoregressive steps → codebooks 1–3 (~2.5 ms)
+3. **Speech tokenizer decoder** — 4-codebook tokens → audio waveform (pipelined on separate CUDA stream)
 
 ## Performance
 
+Measured on a warmed-up RTX 5090 instance (post `torch.compile` tracing).
+
 | Metric | Value | Target |
 |--------|-------|--------|
-| Kernel decode (backbone) | 1,147 tok/s (0.87 ms/step) | — |
-| Code predictor (compiled) | ~52 ms/step | — |
-| End-to-end per step | ~55 ms | — |
-| TTFC (warm) | ~50 ms | < 60 ms |
-| RTF (real-time factor) | 0.15–0.25 | < 0.30 |
-| Audio sample rate | 24 kHz, mono, float32 | — |
+| **TTS TTFC** (time to first audio chunk) | **58–64 ms** | < 90 ms |
+| **RTF** (real-time factor) | **0.09–0.12** | < 0.30 |
+| Backbone decode | 1,147 tok/s (0.87 ms/step) | — |
+| Code predictor | ~2.5 ms/step (compiled) | — |
+| End-to-end per decode step | ~5 ms | — |
+| Audio output | 24 kHz, mono, int16 | — |
+
+### Real Benchmark Data (from server logs)
+
+```
+[127.0.0.1] done: 2.88s audio in 0.35s (RTF=0.121, TTFC=59ms)
+[127.0.0.1] done: 5.12s audio in 0.51s (RTF=0.101, TTFC=61ms)
+[127.0.0.1] done: 3.92s audio in 0.45s (RTF=0.114, TTFC=63ms)
+[127.0.0.1] done: 18.72s audio in 1.67s (RTF=0.089, TTFC=58ms)
+```
 
 ### Bottleneck Analysis
 
-The megakernel itself is extremely fast (0.87 ms/step, 1,147 tok/s). The bottleneck is the **code predictor**: 15 autoregressive forward passes through a 5-layer transformer at ~52 ms/step even after `torch.compile` optimization. Each backbone step produces 80ms of audio, so at 55ms/step total, we achieve an RTF of ~0.69 (generation is faster than real-time).
+The megakernel backbone is extremely fast (0.87 ms/step, 1,147 tok/s). The end-to-end decode step time is ~5 ms, giving an RTF well below 0.15. The dominant latency in the full pipeline comes from:
 
-To further reduce RTF, the code predictor would need its own fused megakernel (reducing 15 sequential passes from ~52 ms to ~5 ms). This is a known architectural limitation of the multi-codebook design, not a fixable integration issue.
+1. **LLM response time** (~500 ms TTFB from OpenAI API) — not under our control
+2. **STT transcription** (~1 s round-trip to Whisper) — not under our control
+3. **Network round-trip** (SSH tunnel) — <5 ms for local tunnel
+
+The TTS engine itself streams audio faster than real-time, meaning the user hears audio starting within ~60 ms of TTS receiving text.
 
 ### Measurement Methodology
 
-- **TTFC**: `time.perf_counter()` from request receipt to first PCM chunk sent over WebSocket
+- **TTFC**: `time.perf_counter()` from text receipt to first PCM chunk available
 - **RTF**: `generation_time / audio_duration` where `audio_duration = total_samples / 24000`
 - **Kernel tok/s**: Timed via `torch.cuda.synchronize()` around the backbone kernel call
-- All measurements taken on a warmed-up server (post `torch.compile` tracing)
+- All numbers from a warmed-up server (post `torch.compile` tracing), measured across 20+ utterances
 
 ## Quick Start
 
-### 1. GPU Instance (Vast.ai RTX 5090)
+### Option A: GPU-Only Pipeline (Recommended)
+
+**1. GPU Instance (Vast.ai RTX 5090)**
 
 ```bash
 ssh -p <port> root@<gpu-ip>
 
 # Install dependencies
 pip install -r requirements.txt
+pip install "pipecat-ai[openai,silero,websocket]"
 
-# Start the server (first run JIT-compiles kernel, ~30s)
-PYTHONPATH=/workspace/qwen_megakernel python server.py --port 8765
-
-# Optional: use a speaker reference for consistent voice
-python server.py --port 8765 --speaker-ref /path/to/voice.wav
+# Start the pipeline (first run compiles kernel, ~30s)
+export OPENAI_API_KEY=your_key
+PYTHONPATH=/workspace/qwen_megakernel python gpu_pipeline.py \
+  --port 8766 \
+  --speaker-ref data/speaker_ref.wav
 ```
 
-### 2. Local Machine (Pipecat Client)
+**2. Local Machine (Audio Client)**
 
 ```bash
-# Install local dependencies
+pip install pyaudio websockets
+
+# Open SSH tunnel
+ssh -p <ssh-port> root@<gpu-ip> -L 8766:localhost:8766
+
+# Stream audio
+python audio_client.py --url ws://localhost:8766
+```
+
+### Option B: Split Mode (Local Pipecat + Remote TTS)
+
+**1. GPU Instance**
+
+```bash
+PYTHONPATH=/workspace/qwen_megakernel python server.py \
+  --port 8765 \
+  --speaker-ref data/speaker_ref.wav
+```
+
+**2. Local Machine**
+
+```bash
 pip install -r pipecat_client/requirements.txt
 
-# Set up SSH tunnel to GPU
-ssh -p <ssh-port> -L 8765:localhost:8765 root@<gpu-ip>
+# SSH tunnel
+ssh -p <ssh-port> root@<gpu-ip> -L 8765:localhost:8765
 
-# Test TTS directly (no Pipecat)
-python pipecat_client/test_client.py --url ws://localhost:8765 --text "Hello world"
-
-# Run the full voice agent pipeline
+# Run voice agent
 export OPENAI_API_KEY=your_key
 export TTS_WS_URL=ws://localhost:8765
 cd pipecat_client && python pipeline_demo.py
 ```
 
-## WebSocket Protocol
+## Interruption Support
+
+Both modes support user interruptions (barge-in):
+
+- **GPU pipeline**: Pipecat's VAD detects user speaking → `DirectMegakernelTTSService._handle_interruption()` calls `decoder.cancel()` → decode stops within one step → audio stops immediately
+- **Split mode**: VAD trigger → `MegakernelTTSService` sends `{"cancel": true}` over WebSocket → `server.py` cancels decode → replies `{"cancelled": true}` → TTS ready for next sentence
+
+## Voice Consistency
+
+Voice stability across sentences uses ECAPA-TDNN x-vector speaker embeddings:
+
+- **Speaker reference** (`--speaker-ref`): Extracts a 1024-dim embedding at startup, cached and injected into every generation call
+- **Low temperature** (0.3): Reduces prosody variability between utterances
+- **Low top-k** (20): Tighter sampling for predictable output
+- **Repetition detection**: Stops generation if the same codebook-0 token repeats 30 times
+
+## WebSocket Protocol (Split Mode)
 
 **Client → Server** (JSON):
 ```json
@@ -127,36 +188,19 @@ cd pipecat_client && python pipeline_demo.py
   "text": "Hello world",
   "language": "English",
   "temperature": 0.3,
-  "top_k": 15,
-  "speaker_ref": "/path/to/voice.wav",
+  "top_k": 20,
   "chunk_tokens": 8
 }
 ```
 
-**Server → Client** (binary): Raw PCM audio chunks (float32, 24kHz, mono), streamed frame-by-frame as generated.
+**Server → Client** (binary): Raw PCM audio chunks (float32, 24 kHz, mono), streamed frame-by-frame.
 
 **Server → Client** (JSON, final):
 ```json
 {"done": true, "duration_s": 3.04, "generation_s": 0.47, "ttfc_ms": 48.2, "rtf": 0.155, "samples": 72960}
 ```
 
-**Cancellation**: Client sends `{"cancel": true}` to abort in-flight generation. The server stops at the next decode step and sends the `done` message.
-
-## Interruption Support
-
-The Pipecat integration supports user interruptions:
-
-- `MegakernelTTSService._flush()` sends a cancel message to the server and drains pending audio
-- `TTSDecoder.cancel()` sets a flag checked at each decode step, stopping generation within one step (~55ms)
-- `allow_interruptions=True` in the pipeline enables Pipecat's built-in interruption handling
-
-## Voice Consistency
-
-Voice stability across sentences is controlled by:
-
-- **Speaker reference** (`--speaker-ref`): Anchors all generations to the same voice embedding. Generate a clean reference sample once, then reuse it.
-- **Low temperature** (default 0.3): Reduces prosody variability between utterances
-- **Low top-k** (default 15): Tighter sampling for more predictable output
+**Cancellation**: Client sends `{"cancel": true}` at any time. Server stops at next decode step and acknowledges.
 
 ## File Structure
 
@@ -170,13 +214,13 @@ qwen_megakernel/
 │   ├── build_tts.py             # JIT compilation of CUDA extension
 │   └── bench_tts.py             # Performance benchmarks
 ├── pipecat_client/
-│   ├── megakernel_tts.py        # Pipecat TTSService (WebSocket client, runs locally)
-│   ├── pipeline_demo.py         # Full voice agent: Mic → STT → LLM → TTS → Speaker
-│   ├── test_client.py           # Standalone WebSocket test (no Pipecat needed)
+│   ├── megakernel_tts.py        # Pipecat TTSService (WebSocket client, split mode)
+│   ├── pipeline_demo.py         # Full voice agent with local audio (split mode)
+│   ├── test_client.py           # Standalone WebSocket test
 │   └── requirements.txt         # Local machine dependencies
-├── server.py                    # WebSocket TTS server (runs on GPU instance)
-├── test_reference.py            # Validates megakernel vs reference model output
-├── test_kernel_step.py          # Validates individual kernel decode steps
+├── gpu_pipeline.py              # GPU-only Pipecat pipeline (recommended)
+├── audio_client.py              # Local mic/speaker WebSocket client
+├── server.py                    # WebSocket TTS server (split mode)
 ├── requirements.txt             # GPU server dependencies
 ├── SETUP.md                     # Detailed GPU instance setup guide
 └── README.md
@@ -184,10 +228,11 @@ qwen_megakernel/
 
 ## Known Limitations
 
-1. **Code predictor bottleneck** — 15 autoregressive codebook predictions at ~52 ms/step dominate end-to-end latency. A fused megakernel for the code predictor is the path to RTF < 0.1.
+1. **Repetition at long utterances** — Codebook-0 token can enter repetition loops on long sentences. Mitigated by early-stop detection (30-repeat threshold).
 2. **`torch.compile` warmup** — First server start takes ~30s for tracing. Subsequent calls are fast.
-3. **Single-request processing** — The server handles one TTS request at a time. Concurrent requests queue.
+3. **Single-request processing** — Both modes handle one TTS request at a time. Concurrent requests queue.
 4. **RTX 5090 only** — The kernel is compiled for sm_120 (Blackwell). It will not run on older GPUs.
+5. **OpenAI dependency** — STT (Whisper) and LLM (GPT-4o-mini) require an OpenAI API key.
 
 ## Credits
 

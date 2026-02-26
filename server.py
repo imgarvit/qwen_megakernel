@@ -64,6 +64,8 @@ class TTSServer:
         remote = websocket.remote_address
         print(f"[{remote}] connected")
 
+        self._decoder.cancel()
+
         try:
             async for raw_msg in websocket:
                 try:
@@ -86,10 +88,19 @@ class TTSServer:
                 top_k = int(msg.get("top_k", 50))
                 chunk_tokens = int(msg.get("chunk_tokens", 8))
 
-                async with self._gen_lock:
+                try:
+                    await asyncio.wait_for(self._gen_lock.acquire(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    self._decoder.cancel()
+                    await asyncio.sleep(0.5)
+                    await self._gen_lock.acquire()
+
+                try:
                     await self._generate_and_stream(
                         websocket, remote, text, language, temperature, top_k, chunk_tokens
                     )
+                finally:
+                    self._gen_lock.release()
 
         except websockets.exceptions.ConnectionClosed:
             self._decoder.cancel()

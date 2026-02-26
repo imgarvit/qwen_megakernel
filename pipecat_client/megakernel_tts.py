@@ -22,6 +22,7 @@ from typing import AsyncGenerator
 
 import numpy as np
 import websockets
+import websockets.exceptions
 
 from pipecat.frames.frames import (
     Frame,
@@ -69,16 +70,23 @@ class MegakernelTTSService(TTSService):
         except Exception:
             is_closed = True
         if is_closed:
+            if self._ws is not None:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
             self._ws = await websockets.connect(
                 self._ws_url,
                 max_size=2**20,
                 ping_interval=30,
                 ping_timeout=60,
+                open_timeout=5,
             )
 
     async def _send_cancel_and_drain(self):
         """Send cancel to the GPU and drain until ack. Keeps WS alive."""
         if not self._ws:
+            self._generating = False
             return
         try:
             await self._ws.send(json.dumps({"cancel": True}))
@@ -88,15 +96,21 @@ class MegakernelTTSService(TTSService):
                     data = json.loads(msg)
                     if data.get("done") or data.get("cancelled"):
                         break
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosedOK,
+                websockets.exceptions.ConnectionClosedError):
             pass
         except Exception:
+            pass
+        finally:
+            self._generating = False
+
+    async def _close_ws(self):
+        if self._ws:
             try:
                 await self._ws.close()
             except Exception:
                 pass
             self._ws = None
-        self._generating = False
 
     async def _handle_interruption(
         self, frame: InterruptionFrame, direction: FrameDirection
@@ -138,9 +152,17 @@ class MegakernelTTSService(TTSService):
                 )
                 for t in pending:
                     t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
                 if interrupt_task in done:
                     recv_task.cancel()
+                    try:
+                        await recv_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     await self._send_cancel_and_drain()
                     break
 
@@ -170,6 +192,9 @@ class MegakernelTTSService(TTSService):
             if self._generating:
                 await self._send_cancel_and_drain()
             raise
+        except websockets.exceptions.ConnectionClosedOK:
+            self._ws = None
+            self._generating = False
         except Exception as e:
             print(f"[MegakernelTTS] connection error: {e}")
             self._ws = None
@@ -178,9 +203,4 @@ class MegakernelTTSService(TTSService):
         yield TTSStoppedFrame(context_id=context_id)
 
     async def cleanup(self):
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
+        await self._close_ws()
