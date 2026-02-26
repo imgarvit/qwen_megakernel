@@ -34,6 +34,7 @@ class TTSServer:
     def __init__(self, speaker_ref: str | None = None):
         print("Loading TTSDecoder...")
         self._decoder = TTSDecoder()
+        self._gen_lock = asyncio.Lock()
         self._cached_spk_embed = None
         if speaker_ref:
             print(f"Extracting speaker embedding from: {speaker_ref}")
@@ -42,7 +43,7 @@ class TTSServer:
         print("TTSDecoder ready.")
 
     def _run_generation_thread(self, queue, loop, text, language, temperature, top_k, chunk_tokens):
-        """Synchronous generation in a background thread. Pushes chunks into an asyncio queue."""
+        """Synchronous generation in a background thread."""
         try:
             for audio_chunk in self._decoder.generate_speech_streaming(
                 text,
@@ -59,44 +60,20 @@ class TTSServer:
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
-    async def _listen_for_cancel(self, websocket):
-        """Concurrently watch for cancel or new request while generation runs."""
+    async def handle(self, websocket):
+        remote = websocket.remote_address
+        print(f"[{remote}] connected")
+
         try:
             async for raw_msg in websocket:
                 try:
                     msg = json.loads(raw_msg)
                 except (json.JSONDecodeError, TypeError):
+                    await websocket.send(json.dumps({"error": "invalid JSON"}))
                     continue
-                if msg.get("cancel"):
-                    self._decoder.cancel()
-                    return "cancelled"
-                if msg.get("text"):
-                    self._pending_msg = msg
-                    self._decoder.cancel()
-                    return "new_request"
-        except websockets.exceptions.ConnectionClosed:
-            self._decoder.cancel()
-            return "disconnected"
-        return None
-
-    async def handle(self, websocket):
-        remote = websocket.remote_address
-        print(f"[{remote}] connected")
-        self._pending_msg = None
-        loop = asyncio.get_event_loop()
-
-        try:
-            async for raw_msg in websocket:
-                msg = self._pending_msg or None
-                self._pending_msg = None
-                if msg is None:
-                    try:
-                        msg = json.loads(raw_msg)
-                    except (json.JSONDecodeError, TypeError):
-                        await websocket.send(json.dumps({"error": "invalid JSON"}))
-                        continue
 
                 if msg.get("cancel"):
+                    self._decoder.cancel()
                     continue
 
                 text = msg.get("text", "")
@@ -109,73 +86,103 @@ class TTSServer:
                 top_k = int(msg.get("top_k", 50))
                 chunk_tokens = int(msg.get("chunk_tokens", 8))
 
-                print(f"[{remote}] TTS: {text[:60]}...")
-                t0 = time.perf_counter()
-                ttfc = None
-                total_samples = 0
-                steps = 0
-
-                self._decoder.reset()
-                queue = asyncio.Queue()
-
-                gen_thread = threading.Thread(
-                    target=self._run_generation_thread,
-                    args=(queue, loop, text, language, temperature, top_k, chunk_tokens),
-                    daemon=True,
-                )
-                gen_thread.start()
-
-                cancel_task = asyncio.create_task(self._listen_for_cancel(websocket))
-
-                cancelled = False
-                try:
-                    while True:
-                        chunk = await queue.get()
-                        if chunk is _SENTINEL:
-                            break
-                        if isinstance(chunk, Exception):
-                            print(f"[{remote}] generation error: {chunk}")
-                            break
-                        if ttfc is None:
-                            ttfc = time.perf_counter() - t0
-                        pcm = chunk.astype(np.float32).tobytes()
-                        await websocket.send(pcm)
-                        total_samples += len(chunk)
-                        steps += 1
-                finally:
-                    cancel_task.cancel()
-                    try:
-                        cancel_result = await cancel_task
-                    except asyncio.CancelledError:
-                        cancel_result = None
-
-                    gen_thread.join(timeout=2.0)
-
-                    cancelled = self._decoder._cancelled
-
-                elapsed = time.perf_counter() - t0
-                duration = total_samples / 24000 if total_samples else 0
-                rtf = elapsed / duration if duration > 0 else 0
-
-                if cancelled:
-                    done_msg = {"cancelled": True, "steps": steps}
-                    print(f"[{remote}] cancelled after {steps} steps ({elapsed:.2f}s)")
-                else:
-                    done_msg = {
-                        "done": True,
-                        "duration_s": round(duration, 3),
-                        "generation_s": round(elapsed, 3),
-                        "ttfc_ms": round((ttfc or 0) * 1000, 1),
-                        "rtf": round(rtf, 3),
-                        "samples": total_samples,
-                    }
-                    print(f"[{remote}] done: {duration:.2f}s audio in {elapsed:.2f}s (RTF={rtf:.3f}, TTFC={((ttfc or 0)*1000):.0f}ms)")
-
-                await websocket.send(json.dumps(done_msg))
+                async with self._gen_lock:
+                    await self._generate_and_stream(
+                        websocket, remote, text, language, temperature, top_k, chunk_tokens
+                    )
 
         except websockets.exceptions.ConnectionClosed:
             self._decoder.cancel()
             print(f"[{remote}] disconnected")
+
+    async def _generate_and_stream(
+        self, websocket, remote, text, language, temperature, top_k, chunk_tokens
+    ):
+        print(f"[{remote}] TTS: {text[:60]}...")
+        t0 = time.perf_counter()
+        ttfc = None
+        total_samples = 0
+        steps = 0
+
+        self._decoder.reset()
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        gen_thread = threading.Thread(
+            target=self._run_generation_thread,
+            args=(queue, loop, text, language, temperature, top_k, chunk_tokens),
+            daemon=True,
+        )
+        gen_thread.start()
+
+        cancelled = False
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    try:
+                        raw = await asyncio.wait_for(websocket.recv(), timeout=0.001)
+                        try:
+                            cancel_msg = json.loads(raw)
+                            if cancel_msg.get("cancel"):
+                                self._decoder.cancel()
+                                cancelled = True
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                        pass
+                    continue
+
+                if chunk is _SENTINEL:
+                    break
+                if isinstance(chunk, Exception):
+                    print(f"[{remote}] generation error: {chunk}")
+                    break
+
+                if ttfc is None:
+                    ttfc = time.perf_counter() - t0
+                try:
+                    pcm = chunk.astype(np.float32).tobytes()
+                    await websocket.send(pcm)
+                    total_samples += len(chunk)
+                    steps += 1
+                except websockets.exceptions.ConnectionClosed:
+                    self._decoder.cancel()
+                    cancelled = True
+                    break
+        finally:
+            gen_thread.join(timeout=3.0)
+            if not cancelled:
+                cancelled = self._decoder._cancelled
+
+        elapsed = time.perf_counter() - t0
+        duration = total_samples / 24000 if total_samples else 0
+        rtf = elapsed / duration if duration > 0 else 0
+
+        if cancelled:
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            done_msg = {"cancelled": True, "steps": steps}
+            print(f"[{remote}] cancelled after {steps} steps ({elapsed:.2f}s)")
+        else:
+            done_msg = {
+                "done": True,
+                "duration_s": round(duration, 3),
+                "generation_s": round(elapsed, 3),
+                "ttfc_ms": round((ttfc or 0) * 1000, 1),
+                "rtf": round(rtf, 3),
+                "samples": total_samples,
+            }
+            print(f"[{remote}] done: {duration:.2f}s audio in {elapsed:.2f}s (RTF={rtf:.3f}, TTFC={((ttfc or 0)*1000):.0f}ms)")
+
+        try:
+            await websocket.send(json.dumps(done_msg))
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
 
 async def main(host: str, port: int, speaker_ref: str | None = None):

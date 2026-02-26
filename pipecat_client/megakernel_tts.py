@@ -4,10 +4,10 @@ Pipecat TTS service that connects to the remote Megakernel TTS WebSocket server.
 Runs on your LOCAL machine as part of the Pipecat pipeline.
 The GPU instance runs server.py and does the actual TTS inference.
 
-Interruption flow (matches ElevenLabs WSS pattern):
+Interruption flow:
   1. VAD detects user speaking → Pipecat sends InterruptionFrame
   2. _handle_interruption sets _interrupt_event
-  3. run_tts sees the event, sends {"cancel": true} to GPU, drains remaining msgs
+  3. run_tts sees the event, sends {"cancel": true} to GPU, drains until ack
   4. GPU stops decode loop immediately, replies {"cancelled": true}
   5. TTS is ready for the next sentence — WebSocket stays alive
 
@@ -32,6 +32,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTSService
+
+DRAIN_TIMEOUT = 3.0
 
 
 class MegakernelTTSService(TTSService):
@@ -80,12 +82,19 @@ class MegakernelTTSService(TTSService):
             return
         try:
             await self._ws.send(json.dumps({"cancel": True}))
-            async for msg in self._ws:
+            while True:
+                msg = await asyncio.wait_for(self._ws.recv(), timeout=DRAIN_TIMEOUT)
                 if isinstance(msg, str):
                     data = json.loads(msg)
                     if data.get("done") or data.get("cancelled"):
                         break
+        except asyncio.TimeoutError:
+            pass
         except Exception:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
             self._ws = None
         self._generating = False
 
@@ -149,7 +158,7 @@ class MegakernelTTSService(TTSService):
                     )
                 elif isinstance(msg, str):
                     data = json.loads(msg)
-                    if data.get("done"):
+                    if data.get("done") or data.get("cancelled"):
                         self._generating = False
                         break
                     if data.get("error"):
