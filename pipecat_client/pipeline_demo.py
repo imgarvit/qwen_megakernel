@@ -37,7 +37,7 @@ from megakernel_tts import MegakernelTTSService
 
 
 async def main():
-    ws_url = os.environ.get("TTS_WS_URL", "ws://localhost:8766")
+    ws_url = os.environ.get("TTS_WS_URL", "ws://localhost:8765")
     openai_key = os.environ["OPENAI_API_KEY"]
 
     stt = OpenAISTTService(

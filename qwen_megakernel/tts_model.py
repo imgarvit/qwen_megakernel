@@ -682,7 +682,7 @@ class TTSDecoder:
         language: str = "English",
         speaker_ref: Optional[str] = None,
         chunk_tokens: int = 4,
-        first_chunk_tokens: int = 1,
+        first_chunk_tokens: int = 4,
         max_tokens: int = 2048,
         temperature: float = 0.9,
         top_k: int = 50,
@@ -849,6 +849,8 @@ class TTSDecoder:
         decode_count = 0
         generated_tokens: list[int] = [first_codebook0]
         left_ctx = 25
+        repeat_count = 0
+        max_repeat = 30
 
         for _ in range(max_tokens):
             if self._cancelled:
@@ -938,6 +940,14 @@ class TTSDecoder:
             if codebook0_token == CODEC_EOS_ID:
                 _log(f"EOS at decode step {decode_count}")
                 break
+
+            if codebook0_token == prev_codebook0:
+                repeat_count += 1
+                if repeat_count >= max_repeat:
+                    _log(f"Repetition loop detected (token {codebook0_token} repeated {repeat_count}x), stopping at step {decode_count}")
+                    break
+            else:
+                repeat_count = 0
 
             generated_tokens.append(codebook0_token)
             prev_codebook0 = codebook0_token

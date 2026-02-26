@@ -42,6 +42,8 @@ Thumbs.db
 
 # Audio samples (generated, not tracked)
 *.wav
+# But allow committed recordings in data/
+!data/recordings/*.wav
 
 # Debug/diagnostic scripts
 diagnose_tokens.py
