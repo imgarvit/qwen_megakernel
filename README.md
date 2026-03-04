@@ -59,6 +59,7 @@ The original `qwen_megakernel` runs Qwen3-0.6B decode at ~1,154 tok/s on a singl
 | Kernel warmup pass | Runs a few dummy decode steps to initialize GPU kernels, allocate buffers, and avoid first-launch latency spikes |
 | Half-split RoPE (pair dim k with k+64) | Qwen3-TTS uses `rotate_half()`, not interleaved pairing |
 | M-RoPE with 3 position axes [24,20,20] | TTS uses multi-axis RoPE for text/audio-time/audio-step |
+| Speech decoder moved to CUDA Graphs | Captures the speech-tokenizer decoder forward pass once and replays it with a single GPU dispatch, eliminating repeated PyTorch kernel-launch/CPU dispatch overhead for many small ops and reducing TTFC / jitter during streaming |
 
 ### TTS Pipeline (per decode step)
 
