@@ -54,14 +54,11 @@ The original `qwen_megakernel` runs Qwen3-0.6B decode at ~1,154 tok/s on a singl
 
 | Change | Why |
 |--------|-----|
-| Half-split RoPE (pair dim k with k+64) | Qwen3-TTS uses `rotate_half()`, not interleaved pairing |
-| M-RoPE with 3 position axes [24,20,20] | TTS uses multi-axis RoPE for text/audio-time/audio-step |
-| Full-precision `expf()` and division | Replaced PTX `ex2.approx` / `rcp.approx` to eliminate attention noise |
-| Removed `--use_fast_math` | Prevents NVCC from replacing `expf` with approximate `__expf` |
-| Host-side barrier resets (`cudaMemsetAsync`) | Fixes race condition on kernel re-launch between PyTorch ops |
 | TTS vocab size (3072 vs 151,936) | ~18% speedup in LM head due to smaller vocabulary |
 | Code predictor backbone moved to megakernel | Eliminates multiple PyTorch kernel launches and reuses the optimized persistent kernel decode path |
 | Kernel warmup pass | Runs a few dummy decode steps to initialize GPU kernels, allocate buffers, and avoid first-launch latency spikes |
+| Half-split RoPE (pair dim k with k+64) | Qwen3-TTS uses `rotate_half()`, not interleaved pairing |
+| M-RoPE with 3 position axes [24,20,20] | TTS uses multi-axis RoPE for text/audio-time/audio-step |
 
 ### TTS Pipeline (per decode step)
 
